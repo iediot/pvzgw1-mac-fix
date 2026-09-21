@@ -4,3 +4,5 @@
 notes/
 scratch/
 *.log
+.testbuild/
+*.dylib

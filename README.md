@@ -1,7 +1,7 @@
 # Plants vs. Zombies: Garden Warfare on Apple Silicon
 
 Runs the 2014 Origin/EA release under CrossOver on Apple Silicon, on
-CrossOver's native **D3DMetal** backend — no DXVK, no MoltenVK translation of
+CrossOver's native **D3DMetal** backend; no DXVK, no MoltenVK translation of
 the game's rendering, and no modified game files.
 
 ```sh
@@ -91,7 +91,7 @@ by default.
 
 - The patch ships as a replacement `libMoltenVK.dylib` that re-exports the
   real one, because that is what gets loaded into every wine process. That
-  path is **shared by all bottles**, and a CrossOver update will replace it —
+  path is **shared by all bottles**, and a CrossOver update will replace it,
   re-run `apply` afterwards. `revert` restores the original.
 - The offsets in `src/gw1_d3dmetal.m` are specific to one build of D3DMetal.
   Every patch site is validated against its expected bytes before anything is
@@ -110,7 +110,7 @@ The buffer render-target path measures clean while this is happening:
 
 - every buffer RTV the game creates is successfully aliased onto its buffer
   (no unaliased fallbacks, no allocation failures)
-- the aliased allocation never goes stale — 21,504 checks of the buffer's
+- the aliased allocation never goes stale: 21,504 checks of the buffer's
   current storage entry against what was aliased, zero divergence
 - clears and draws reach the original buffer, verified by readback
 - a GPU-only probe with no CPU synchronisation in the loop shows no gross

@@ -101,9 +101,24 @@ by default.
 
 ## Known limitation
 
-There is still a small amount of flickering in **sea mist**. Buffer-RTV writes
-and clears are verified by readback, so the general path is correct; the
-remaining cases under investigation are whether the aliased allocation is
-still the buffer's current one after a rename, and whether GPU-side ordering
-between writes through the view and later reads of the buffer is guaranteed
-without the CPU synchronisation the tests currently perform.
+A narrow band of **sea mist** flickers on and off at certain viewpoints:
+moving closer makes it disappear, moving back makes it reappear, and standing
+on the boundary makes it alternate. It is a clean binary on/off, with no
+dropped frames.
+
+The buffer render-target path measures clean while this is happening:
+
+- every buffer RTV the game creates is successfully aliased onto its buffer
+  (no unaliased fallbacks, no allocation failures)
+- the aliased allocation never goes stale — 21,504 checks of the buffer's
+  current storage entry against what was aliased, zero divergence
+- clears and draws reach the original buffer, verified by readback
+- a GPU-only probe with no CPU synchronisation in the loop shows no gross
+  ordering failure between writes through the view and later reads
+- no faults and no Metal errors
+
+The cause is **not established**. The behaviour is equally consistent with a
+game-side visibility or fade threshold oscillating at its boundary, which
+would also occur on Windows, and no Windows reference was available to
+compare against. It is recorded here as an open, minor issue rather than
+attributed to this patch.

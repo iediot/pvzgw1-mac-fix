@@ -1,0 +1,109 @@
+name: release
+
+# Every push to main publishes a release. Add [skip release] to a commit
+# message to push without one.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer parses
+        run: bash -n pvzgw1-fix.sh
+
+      # The patch cannot be linked here: it re-exports the user's own
+      # libMoltenVK_real.dylib, which only exists on a machine with CrossOver.
+      # Syntax-checking is what CI can honestly verify.
+      - name: Patch source compiles
+        run: clang -arch x86_64 -fsyntax-only -fobjc-arc src/gw1_d3dmetal.m
+
+      - name: Test harness compiles
+        run: clang -arch x86_64 -fsyntax-only tests/check_native.c
+
+      # tests/check_wine.c and tests/compile_shaders.c target Windows and need
+      # mingw plus the d3d headers, so they are not built here.
+
+      - name: No vendor binaries committed
+        run: |
+          if git ls-files | grep -iE '\.(dylib|dll|exe|framework)$'; then
+            echo "::error::vendor or built binaries must not be committed"
+            exit 1
+          fi
+
+      - name: No absolute home paths
+        run: |
+          if git grep -nE '/Users/[A-Za-z0-9_.-]+' -- .; then
+            echo "::error::absolute home paths found"
+            exit 1
+          fi
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the version
+        id: meta
+        run: |
+          version="v$(date -u +%Y.%m.%d).${GITHUB_RUN_NUMBER}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=pvzgw1-mac-fix-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the archives
+        run: |
+          set -euo pipefail
+          name='${{ steps.meta.outputs.name }}'
+          mkdir -p "dist/$name"
+          cp -R pvzgw1-fix.sh README.md src tests "dist/$name/"
+          chmod +x "dist/$name/pvzgw1-fix.sh"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          zip -qr "$name.zip" "$name"
+          shasum -a 256 "$name.tar.gz" "$name.zip" > SHA256SUMS.txt
+          ls -la
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version='${{ steps.meta.outputs.version }}'
+          name='${{ steps.meta.outputs.name }}'
+          cat > notes.md <<'EOF'
+          Run Plants vs. Zombies: Garden Warfare under CrossOver on Apple
+          Silicon, on the native D3DMetal backend.
+
+          ```sh
+          ./pvzgw1-fix.sh apply
+          ./pvzgw1-fix.sh launch
+          ```
+
+          Requires CrossOver with the Apple GPTK backend and the Xcode command
+          line tools. The patch is compiled on your machine by `apply`, because
+          it links against your own CrossOver MoltenVK; no vendor binaries are
+          redistributed and Apple's D3DMetal is never modified on disk.
+
+          See the README for what is fixed and for the known smoke-effect
+          flicker.
+          EOF
+          gh release create "$version" \
+            "dist/$name.tar.gz" "dist/$name.zip" "dist/SHA256SUMS.txt" \
+            --title "$version" \
+            --notes-file notes.md \
+            --generate-notes

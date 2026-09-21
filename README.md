@@ -101,10 +101,10 @@ by default.
 
 ## Known limitation
 
-A narrow band of **sea mist** flickers on and off at certain viewpoints:
-moving closer makes it disappear, moving back makes it reappear, and standing
-on the boundary makes it alternate. It is a clean binary on/off, with no
-dropped frames.
+Some **smoke effects** flicker on and off at certain viewpoints: moving
+closer makes the effect disappear, moving back makes it reappear, and
+standing on the boundary makes it alternate. It is a clean binary on/off with
+no dropped frames, and it affects a small number of effects.
 
 The buffer render-target path measures clean while this is happening:
 

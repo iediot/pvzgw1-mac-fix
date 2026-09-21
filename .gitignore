@@ -1,0 +1,6 @@
+# local notes, scratch and captures — not for publication
+*.old
+*.bak*
+notes/
+scratch/
+*.log

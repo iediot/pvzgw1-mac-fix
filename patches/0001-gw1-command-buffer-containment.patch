@@ -1,0 +1,664 @@
+--- a/src/dxvk/dxvk_context.h
++++ b/src/dxvk/dxvk_context.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <fstream>
+ 
+ #include "dxvk_barrier.h"
+ #include "dxvk_bind_mask.h"
+@@ -56,6 +57,47 @@
+      * buffer and allocates a new one.
+      */
+     void flushCommandList();
++
++    // GW1: split oversized command buffers to stay under the Metal GPU watchdog.
++    // Threshold comes from DXVK_SPLIT_DRAWS; 0 disables (stock behaviour).
++    void gw1ConsiderSplit();
++
++    // Called once per present, from the swapchain's CS lambda. Frame weight is
++    // what separates a menu/loading screen from a match; per-pass attachment
++    // format cannot, because the menu uses the same HDR+depth targets.
++    void gw1EndFrame();
++    uint32_t m_gw1DrawsInFrame   = 0;
++    uint32_t m_gw1Flushes        = 0;
++    uint32_t m_gw1PassIndex      = 0;
++    const void* m_gw1LastFs      = nullptr;
++
++    // Stable index per fragment shader, assigned on first sight and logged with
++    // its hash, so a shader can be named on the command line for splitting or
++    // skipping. Used to bisect which shaders actually need isolation (cost) and
++    // which one is failing (the residual flicker).
++    std::unordered_map<const void*, uint32_t> m_gw1FsIds;
++    uint32_t gw1FsId();
++    bool     gw1SkipDraw();
++
++    // The split must happen BEFORE the draw that changed shader is recorded,
++    // otherwise that draw lands in the outgoing command buffer and shares the
++    // previous shader's failure domain. DXVK_SPLIT_PRE selects which side.
++    void     gw1PreDraw();
++    void     gw1PostDraw();
++    uint32_t m_gw1LastFrameDraws = 0;
++    bool     m_gw1SplitActive    = false;
++    uint32_t m_gw1LightStreak    = 0;
++    void gw1TraceDraw();
++    void gw1TraceEnd(bool suspend);
++    std::ofstream m_gw1TraceFile;
++    uint32_t m_gw1TracePoll=0, m_gw1TraceRows=0, m_gw1TraceDraws=0, m_gw1TraceSplits=0;
++    uint64_t m_gw1TraceStart=0;
++    std::string m_gw1TraceKey, m_gw1TraceAttachments, m_gw1TraceFirstFs, m_gw1TraceLastFs;
++
++    uint32_t m_gw1DrawsSinceFlush = 0;
++    uint32_t m_gw1DrawsInPass    = 0;
++    bool     m_gw1WantFlush = false;
++    bool     m_gw1Flushing  = false;
+     
+     /**
+      * \brief Begins generating query data
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -1,3 +1,6 @@
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
+ #include <cstring>
+ #include <vector>
+ #include <utility>
+@@ -91,6 +94,395 @@
+     this->beginRecording(
+       m_device->createCommandList());
+   }
++
++
++  void DxvkContext::gw1TraceDraw() {
++    if (!m_gw1TraceFile.is_open()) {
++      if ((++m_gw1TracePoll & 255) != 0) return;
++      // Presenter/HUD contexts have unkeyed shaders; capture game contexts only.
++      if (m_state.gp.shaders.fs == nullptr) return;
++      const auto shaderName=m_state.gp.shaders.fs->debugName();
++      if (shaderName.find("da39a3ee5e6b4b0d3255bfef95601890afd80709") != std::string::npos) return;
++      const char* labels[] = { "menu", "match" };
++      for (const char* label : labels) {
++        const auto trigger = str::format("C:/gw1diag/pass-", label, ".flag");
++        if (::GetFileAttributesA(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
++        ::DeleteFileA(trigger.c_str());
++        m_gw1TraceFile.open(str::format("C:/gw1diag/pass-", label, ".txt"), std::ios::trunc);
++        if (!m_gw1TraceFile.is_open()) return;
++        m_gw1TraceFile << "pass-trace-v2 attachment-change groups; first/last group may be partial; formats/layouts are Vulkan enums\n";
++        m_gw1TraceStart = ::GetTickCount64();
++        m_gw1TraceRows = m_gw1TraceDraws = m_gw1TraceSplits = 0;
++        break;
++      }
++      if (!m_gw1TraceFile.is_open()) return;
++    }
++    const auto& currentFb=m_state.om.framebufferInfo;
++    std::string attachmentKey;
++    for (uint32_t i=0;i<currentFb.numAttachments();i++) {
++      const auto& a=currentFb.getAttachment(i);
++      attachmentKey += str::format(currentFb.getColorAttachmentIndex(i), ":", a.view.ptr(), ";");
++    }
++    if (m_gw1TraceDraws && attachmentKey != m_gw1TraceKey) {
++      this->gw1TraceEnd(false);
++      if (!m_gw1TraceFile.is_open()) return;
++    }
++    m_gw1TraceKey=attachmentKey;
++    if (!m_gw1TraceDraws) {
++      const auto& fb = m_state.om.framebufferInfo;
++      auto size = fb.size();
++      m_gw1TraceAttachments = str::format("fb=",size.width,"x",size.height,
++        " attachments=",fb.numAttachments()," depth=",fb.getDepthTarget().view != nullptr);
++      for (uint32_t i=0;i<fb.numAttachments();i++) {
++        const auto& a=fb.getAttachment(i);
++        if (a.view == nullptr) continue;
++        const auto& im=a.view->image()->info();
++        const auto& vi=a.view->info();
++        m_gw1TraceAttachments += str::format(" [slot=",fb.getColorAttachmentIndex(i),
++          " image=",a.view->image().ptr()," fmt=",vi.format," size=",im.extent.width,"x",im.extent.height,
++          " mip=",vi.minLevel," layer=",vi.minLayer," layers=",vi.numLayers,
++          " samples=",im.sampleCount," usage=",im.usage," commonLayout=",im.layout,
++          " boundLayout=",a.layout,
++          " presentLayout=",im.layout==VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++          "]");
++      }
++      m_gw1TraceFirstFs=m_state.gp.shaders.fs != nullptr ? m_state.gp.shaders.fs->debugName() : "none";
++    }
++    ++m_gw1TraceDraws;
++    m_gw1TraceLastFs=m_state.gp.shaders.fs != nullptr ? m_state.gp.shaders.fs->debugName() : "none";
++  }
++
++  void DxvkContext::gw1TraceEnd(bool suspend) {
++    if (!m_gw1TraceFile.is_open()) return;
++    if (suspend && m_gw1TraceDraws) ++m_gw1TraceSplits;
++    bool expired=::GetTickCount64()-m_gw1TraceStart>=2000;
++    if ((!suspend || expired) && m_gw1TraceDraws) {
++      m_gw1TraceFile << "pass=" << m_gw1TraceRows++ << " draws=" << m_gw1TraceDraws
++        << " suspends=" << m_gw1TraceSplits << " " << m_gw1TraceAttachments
++        << " firstFS=" << m_gw1TraceFirstFs << " lastFS=" << m_gw1TraceLastFs << "\n";
++      m_gw1TraceDraws=m_gw1TraceSplits=0;
++    }
++    if (expired || m_gw1TraceRows>=256) {
++      m_gw1TraceFile << "complete rows=" << m_gw1TraceRows << " elapsedMs=" << ::GetTickCount64()-m_gw1TraceStart << "\n";
++      m_gw1TraceFile.close();
++    }
++  }
++
++  uint32_t DxvkContext::gw1FsId() {
++    const void* fs = m_state.gp.shaders.fs.ptr();
++    auto it = m_gw1FsIds.find(fs);
++
++    if (it != m_gw1FsIds.end())
++      return it->second;
++
++    uint32_t id = uint32_t(m_gw1FsIds.size());
++    m_gw1FsIds.insert({ fs, id });
++
++    Logger::warn(str::format("GW1FS id=", id, " fs=",
++      m_state.gp.shaders.fs != nullptr
++        ? m_state.gp.shaders.fs->debugName() : "none"));
++    return id;
++  }
++
++
++  // Drop draws whose fragment shader falls in [DXVK_SKIP_FS_LO, DXVK_SKIP_FS_HI).
++  // Bisecting with this finds the shader responsible for the residual flicker:
++  // splitting can only contain those failures, never prevent them, so the only
++  // way to make them stop is to not issue them.
++  bool DxvkContext::gw1SkipDraw() {
++    static const uint32_t lo = [] {
++      const char* e = std::getenv("DXVK_SKIP_FS_LO");
++      return e ? uint32_t(std::atoi(e)) : ~0u;
++    }();
++    static const uint32_t hi = [] {
++      const char* e = std::getenv("DXVK_SKIP_FS_HI");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++
++    if (lo == ~0u)
++      return false;
++
++    uint32_t id = gw1FsId();
++    return id >= lo && id < hi;
++  }
++
++
++  static bool gw1SplitPre() {
++    static const bool pre = std::getenv("DXVK_SPLIT_PRE") != nullptr;
++    return pre;
++  }
++
++
++  void DxvkContext::gw1PreDraw() {
++    if (gw1SplitPre())
++      this->gw1ConsiderSplit();
++  }
++
++
++  void DxvkContext::gw1PostDraw() {
++    if (!gw1SplitPre())
++      this->gw1ConsiderSplit();
++  }
++
++
++  void DxvkContext::gw1EndFrame() {
++    static const bool logFrames = std::getenv("DXVK_LOG_FRAMES") != nullptr;
++    static uint32_t n = 0;
++
++    if (logFrames && !(n++ & 31))
++      Logger::warn(str::format("GW1FRAME draws=", m_gw1DrawsInFrame, " flushes=", m_gw1Flushes));
++
++    // Hysteresis on the frame-weight gate. A single sparse camera angle can dip
++    // a match frame below the threshold; without hysteresis the next frame
++    // loses splitting entirely and dies whole, which looks like angle-dependent
++    // flicker. Turn splitting on immediately when a heavy frame appears, but
++    // only turn it off after a sustained run of light frames (a real return to
++    // a menu or loading screen).
++    static const uint32_t frameMinHys = [] {
++      const char* e = std::getenv("DXVK_SPLIT_FRAME_MIN");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++    static const uint32_t offAfter = [] {
++      const char* e = std::getenv("DXVK_SPLIT_OFF_AFTER");
++      return e ? uint32_t(std::atoi(e)) : 30u;
++    }();
++
++    if (m_gw1DrawsInFrame >= frameMinHys) {
++      m_gw1SplitActive = true;
++      m_gw1LightStreak = 0;
++    } else if (++m_gw1LightStreak >= offAfter) {
++      m_gw1SplitActive = false;
++    }
++
++    m_gw1PassIndex      = 0;
++    m_gw1Flushes        = 0;
++    m_gw1LastFrameDraws = m_gw1DrawsInFrame;
++    m_gw1DrawsInFrame   = 0;
++  }
++
++
++  void DxvkContext::gw1ConsiderSplit() {
++    // Bounded pass capture disabled for this performance trial.
++    static const uint32_t threshold = [] {
++      const char* e = std::getenv("DXVK_SPLIT_DRAWS");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++
++    static const bool logDraws = std::getenv("DXVK_LOG_DRAWS") != nullptr;
++
++    if (logDraws) {
++      // Name the shaders this draw used, so a GPU fault reported right after
++      // the submit can be attributed to it. Only meaningful together with
++      // DXVK_SPLIT_DRAWS=1 and MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=1, which
++      // make submission order and fault order line up.
++      // Straight to stderr, not Logger: MoltenVK's GPU faults go to stderr, and
++      // the two streams have to interleave for a fault to be attributable to
++      // the draw that preceded it. Logger writes to a separate file.
++      // WriteFile on STD_ERROR_HANDLE, not C stderr: under Wine the std handle
++      // is the same unix fd MoltenVK writes its GPU faults to, so the two
++      // interleave. The CRT's stderr is a different stream and never appears.
++      std::string line = str::format("GW1DRAW fs=",
++        m_state.gp.shaders.fs != nullptr ? m_state.gp.shaders.fs->debugName() : "none",
++        " vs=",
++        m_state.gp.shaders.vs != nullptr ? m_state.gp.shaders.vs->debugName() : "none",
++        "\n");
++      DWORD written = 0;
++      ::WriteFile(::GetStdHandle(STD_ERROR_HANDLE),
++        line.data(), DWORD(line.size()), &written, nullptr);
++    }
++
++    if (!threshold)
++      return;
++
++    // Do NOT flush here. Flushing mid-render-pass forces a suspend/resume of
++    // the framebuffer around every split, which shows up on screen as
++    // flickering. Just mark a split as wanted; spillRenderPass() performs it at
++    // the next natural pass boundary, where the attachments are being ended
++    // anyway and nothing extra is stored or reloaded.
++    // Splitting mid-pass suspends/resumes the framebuffer around each split,
++    // which flickers; splitting only at pass boundaries avoids that but cannot
++    // break up a single long pass. Mid-pass is the default because it is the
++    // configuration measured to actually render.
++    static const bool atPass = std::getenv("DXVK_SPLIT_AT_PASS") != nullptr;
++
++    // Never split a small render pass. Loading screens and menus draw only a
++    // handful of primitives per pass; splitting one of those in half forces a
++    // framebuffer suspend/resume that loses the pass contents, which shows up
++    // as dead/black frames. In-match passes are large and are exactly the ones
++    // that need splitting. DXVK_SPLIT_PASS_MIN is the number of draws a pass
++    // must already have before it is eligible to be split at all.
++    static const uint32_t passMin = [] {
++      const char* e = std::getenv("DXVK_SPLIT_PASS_MIN");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++
++    // Frame-weight gate. A menu or loading screen frame is a few hundred draws;
++    // a match frame is thousands. Splitting is only ever needed in the heavy
++    // frames, and it is precisely what breaks the light ones (lost pass
++    // contents -> missing menu elements, flickering loading screens). Attachment
++    // format cannot separate the two: the menu renders to the same HDR+depth
++    // targets gameplay does. Frame weight can.
++    //
++    // The current frame's count is still incomplete this early, so the previous
++    // frame is used as the predictor; consecutive frames are near-identical in
++    // weight, and a one-frame lag at a scene transition is harmless.
++    static const uint32_t frameMin = [] {
++      const char* e = std::getenv("DXVK_SPLIT_FRAME_MIN");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++
++    ++m_gw1DrawsInFrame;
++
++    if (frameMin && m_gw1LastFrameDraws < frameMin)
++      return;
++
++    // Splitting every pass costs a full attachment store+reload per split, which
++    // on a tile GPU saturates memory bandwidth. Only a few passes actually
++    // contain draws that fail, so restrict splitting to a range of pass indices
++    // and bisect to find them: DXVK_SPLIT_PASS_LO <= index < DXVK_SPLIT_PASS_HI.
++    // Unset HI means no upper bound.
++    static const uint32_t passLo = [] {
++      const char* e = std::getenv("DXVK_SPLIT_PASS_LO");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++    static const uint32_t passHi = [] {
++      const char* e = std::getenv("DXVK_SPLIT_PASS_HI");
++      return e ? uint32_t(std::atoi(e)) : ~0u;
++    }();
++
++    if (m_gw1PassIndex < passLo || m_gw1PassIndex >= passHi)
++      return;
++
++    // Bisect by position within the frame. Splitting every draw costs a full
++    // attachment store+reload each time, which saturates tile-GPU bandwidth;
++    // only some draws actually need it. Restrict splitting to
++    // DXVK_SPLIT_DRAW_LO <= drawIndex < DXVK_SPLIT_DRAW_HI and halve the range
++    // until the smallest window that still renders coherently is found.
++    static const uint32_t drawLo = [] {
++      const char* e = std::getenv("DXVK_SPLIT_DRAW_LO");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++    static const uint32_t drawHi = [] {
++      const char* e = std::getenv("DXVK_SPLIT_DRAW_HI");
++      return e ? uint32_t(std::atoi(e)) : ~0u;
++    }();
++
++    if (m_gw1DrawsInFrame < drawLo || m_gw1DrawsInFrame >= drawHi)
++      return;
++
++    // Splitting does not prevent the GPU fault -- it CONTAINS it. A failed
++    // command buffer loses only the draws it holds, so one buffer per frame
++    // loses the whole frame (black screen) while one buffer per draw loses only
++    // the draws that actually fail. That is why the fault count never reaches
++    // zero however finely we split, and why the picture keeps improving anyway.
++    //
++    // If containment is the mechanism, splitting after every draw is massive
++    // overkill: the failing draws just need to be isolated from the good ones.
++    // Draws sharing a pipeline succeed or fail together, so a shader change is
++    // a natural containment boundary -- and there are ~40-60 of those per frame
++    // instead of ~870 draws, which is a >10x cut in attachment store/reload
++    // traffic for the same isolation.
++    static const bool onShader = std::getenv("DXVK_SPLIT_ON_SHADER") != nullptr;
++
++    if (onShader) {
++      ++m_gw1DrawsSinceFlush;
++      const void* fs = m_state.gp.shaders.fs.ptr();
++
++      if (fs == m_gw1LastFs)
++        return;
++
++      m_gw1LastFs = fs;
++      m_gw1Flushes++;
++
++      // Only isolate shaders in [DXVK_SPLIT_FS_LO, DXVK_SPLIT_FS_HI). Most
++      // shaders never fail, so isolating them buys nothing and costs a full
++      // attachment store+reload each time. Bisect to the few that matter.
++      static const uint32_t fsLo = [] {
++        const char* e = std::getenv("DXVK_SPLIT_FS_LO");
++        return e ? uint32_t(std::atoi(e)) : 0u;
++      }();
++      static const uint32_t fsHi = [] {
++        const char* e = std::getenv("DXVK_SPLIT_FS_HI");
++        return e ? uint32_t(std::atoi(e)) : ~0u;
++      }();
++
++      if (fsLo || fsHi != ~0u) {
++        uint32_t id = gw1FsId();
++
++        if (id < fsLo || id >= fsHi)
++          return;
++      }
++
++      // Don't split on a shader change that is only a draw or two after the
++      // last split -- the containment gained is negligible and each split still
++      // costs a full attachment store+reload. Requiring a minimum batch keeps
++      // the boundaries shader-aligned while cutting the split count.
++      static const uint32_t minBatch = [] {
++        const char* e = std::getenv("DXVK_SPLIT_MIN_BATCH");
++        return e ? uint32_t(std::atoi(e)) : 0u;
++      }();
++
++      if (m_gw1DrawsSinceFlush < minBatch)
++        return;
++
++      m_gw1DrawsSinceFlush = 0;
++      this->flushCommandList();
++      return;
++    }
++
++    // GW1 trial: attachment signatures observed in gameplay, absent from the
++    // captured menu. These are candidates, not attributed GPU-fault signatures.
++    const auto& targets = m_state.om.framebufferInfo;
++    const bool hasDepth = targets.getDepthTarget().view != nullptr;
++    uint32_t colorCount = 0;
++    bool hdrDepth = false, maskDepth = false, wideFloat = false;
++    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
++      const auto& color = targets.getColorTarget(i);
++      if (color.view == nullptr) continue;
++      ++colorCount;
++      const auto format = color.view->info().format;
++      const auto extent = color.view->image()->info().extent;
++      hdrDepth |= hasDepth && format == VK_FORMAT_R16G16B16A16_SFLOAT;
++      maskDepth |= hasDepth && format == VK_FORMAT_R8_UNORM;
++      wideFloat |= format == VK_FORMAT_R32G32B32A32_SFLOAT
++        && extent.height == 1 && extent.width >= 1024;
++    }
++    const bool forceSplit = hdrDepth || maskDepth || wideFloat
++      || (hasDepth && (colorCount == 0 || colorCount == 2));
++    ++m_gw1DrawsInPass;
++
++    // PASS_MIN exempted small passes from splitting. That is backwards: the
++    // draws that fail live in SMALL passes (lighting, effects) -- PASS_MIN=0
++    // renders correctly and PASS_MIN=10 leaves lighting detached, so the
++    // culprits are inside the first few draws of a pass. Splitting those is
++    // cheap precisely because there are few of them.
++    //
++    // So: split after every draw for the first DXVK_SPLIT_EARLY draws of a
++    // pass, then fall back to every DXVK_SPLIT_DRAWS draws. Small passes are
++    // fully covered; large passes pay the aggressive rate only at the start.
++    static const uint32_t earlyDraws = [] {
++      const char* e = std::getenv("DXVK_SPLIT_EARLY");
++      return e ? uint32_t(std::atoi(e)) : 0u;
++    }();
++
++    if (!forceSplit && passMin && m_gw1DrawsInPass <= passMin)
++      return;
++
++    uint32_t splitThreshold = threshold;
++
++    if (earlyDraws && m_gw1DrawsInPass <= earlyDraws)
++      splitThreshold = 1;
++    else if (hasDepth && colorCount == 0)
++      splitThreshold = std::max(threshold, 4u);   // amortize shadow submits
++    if (++m_gw1DrawsSinceFlush >= splitThreshold) {
++      m_gw1DrawsSinceFlush = 0;
++
++      if (atPass)
++        m_gw1WantFlush = true;
++      else
++        this->flushCommandList();
++    }
++  }
+   
+   
+   void DxvkContext::beginQuery(const Rc<DxvkGpuQuery>& query) {
+@@ -1390,6 +1782,11 @@
+           uint32_t instanceCount,
+           uint32_t firstVertex,
+           uint32_t firstInstance) {
++    if (this->gw1SkipDraw())
++      return;
++
++    this->gw1PreDraw();
++
+     if (this->commitGraphicsState<false, false>()) {
+       m_cmd->cmdDraw(
+         vertexCount, instanceCount,
+@@ -1397,6 +1794,7 @@
+     }
+     
+     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
++    this->gw1PostDraw();
+   }
+   
+   
+@@ -1404,6 +1802,11 @@
+           VkDeviceSize      offset,
+           uint32_t          count,
+           uint32_t          stride) {
++    if (this->gw1SkipDraw())
++      return;
++
++    this->gw1PreDraw();
++
+     if (this->commitGraphicsState<false, true>()) {
+       auto descriptor = m_state.id.argBuffer.getDescriptor();
+       
+@@ -1414,6 +1817,7 @@
+     }
+     
+     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
++    this->gw1PostDraw();
+   }
+   
+   
+@@ -1422,6 +1826,11 @@
+           VkDeviceSize      countOffset,
+           uint32_t          maxCount,
+           uint32_t          stride) {
++    if (this->gw1SkipDraw())
++      return;
++
++    this->gw1PreDraw();
++
+     if (this->commitGraphicsState<false, true>()) {
+       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
+       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
+@@ -1435,6 +1844,7 @@
+     }
+     
+     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
++    this->gw1PostDraw();
+   }
+   
+   
+@@ -1444,6 +1854,11 @@
+           uint32_t firstIndex,
+           uint32_t vertexOffset,
+           uint32_t firstInstance) {
++    if (this->gw1SkipDraw())
++      return;
++
++    this->gw1PreDraw();
++
+     if (this->commitGraphicsState<true, false>()) {
+       m_cmd->cmdDrawIndexed(
+         indexCount, instanceCount,
+@@ -1452,6 +1867,7 @@
+     }
+     
+     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
++    this->gw1PostDraw();
+   }
+   
+   
+@@ -1459,6 +1875,11 @@
+           VkDeviceSize      offset,
+           uint32_t          count,
+           uint32_t          stride) {
++    if (this->gw1SkipDraw())
++      return;
++
++    this->gw1PreDraw();
++
+     if (this->commitGraphicsState<true, true>()) {
+       auto descriptor = m_state.id.argBuffer.getDescriptor();
+       
+@@ -1469,6 +1890,7 @@
+     }
+     
+     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
++    this->gw1PostDraw();
+   }
+   
+   
+@@ -1477,6 +1899,11 @@
+           VkDeviceSize      countOffset,
+           uint32_t          maxCount,
+           uint32_t          stride) {
++    if (this->gw1SkipDraw())
++      return;
++
++    this->gw1PreDraw();
++
+     if (this->commitGraphicsState<true, true>()) {
+       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
+       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
+@@ -1490,6 +1917,7 @@
+     }
+     
+     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
++    this->gw1PostDraw();
+   }
+   
+   
+@@ -1497,6 +1925,11 @@
+     const DxvkBufferSlice&  counterBuffer,
+           uint32_t          counterDivisor,
+           uint32_t          counterBias) {
++    if (this->gw1SkipDraw())
++      return;
++
++    this->gw1PreDraw();
++
+     if (this->commitGraphicsState<false, false>()) {
+       auto physSlice = counterBuffer.getSliceHandle();
+ 
+@@ -1508,6 +1941,7 @@
+     }
+ 
+     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
++    this->gw1PostDraw();
+   }
+ 
+ 
+@@ -3864,6 +4298,7 @@
+   
+   
+   void DxvkContext::spillRenderPass(bool suspend) {
++    // Pass capture disabled for this performance trial.
+     if (m_flags.test(DxvkContextFlag::GpRenderPassBound)) {
+       m_flags.clr(DxvkContextFlag::GpRenderPassBound);
+ 
+@@ -3882,17 +4317,43 @@
+       m_gfxBarriers.recordCommands(m_cmd);
+ 
+       this->unbindGraphicsPipeline();
++
++      // Only a real pass end restarts the count. A split suspends the pass and
++      // resumes it, which is still logically the same pass -- resetting there
++      // made every split look like a fresh pass and broke any rule based on
++      // position within the pass.
++      if (!suspend) {
++        m_gw1DrawsInPass = 0;
++        m_gw1PassIndex++;
++      }
+     } else if (!suspend) {
+       // We may end a previously suspended render pass
+       if (m_flags.test(DxvkContextFlag::GpRenderPassSuspended)) {
+         m_flags.clr(DxvkContextFlag::GpRenderPassSuspended);
+         this->transitionRenderTargetLayouts(m_gfxBarriers, false);
+         m_gfxBarriers.recordCommands(m_cmd);
++
++        // A pass that was split ends here, not in the bound branch above --
++        // the split already cleared GpRenderPassBound. This is where most
++        // passes actually finish once splitting is active.
++        m_gw1DrawsInPass = 0;
++        m_gw1PassIndex++;
+       }
+ 
+       // Execute deferred clears if necessary
+       this->flushClears(false);
+     }
++
++    // A split was requested by gw1ConsiderSplit(). suspend=false means this is
++    // a real pass boundary, so ending the command buffer here costs nothing
++    // extra. endRecording() only ever spills with suspend=true, so this cannot
++    // re-enter; the guard is belt-and-braces.
++    if (!suspend && m_gw1WantFlush && !m_gw1Flushing) {
++      m_gw1WantFlush = false;
++      m_gw1Flushing  = true;
++      this->flushCommandList();
++      m_gw1Flushing  = false;
++    }
+   }
+ 
+ 
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -334,6 +334,8 @@
+         cHud->update();
+ 
+       m_device->presentImage(m_presenter, &m_presentStatus);
++
++      ctx->gw1EndFrame();
+     });
+ 
+     pContext->FlushCsChunk();

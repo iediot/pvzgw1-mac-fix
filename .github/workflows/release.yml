@@ -102,8 +102,11 @@ jobs:
           See the README for what is fixed and for the known smoke-effect
           flicker.
           EOF
+          # The tag does not need to exist: gh creates it. --target pins it to
+          # the commit this run was triggered by, rather than whatever the
+          # default branch happens to point at when the job reaches this step.
           gh release create "$version" \
             "dist/$name.tar.gz" "dist/$name.zip" "dist/SHA256SUMS.txt" \
+            --target "$GITHUB_SHA" \
             --title "$version" \
-            --notes-file notes.md \
-            --generate-notes
+            --notes-file notes.md
